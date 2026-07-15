@@ -1,0 +1,60 @@
+{
+  "name": "@thunstack/auto-compact",
+  "version": "0.1.0",
+  "description": "Early, configurable context auto-compaction for Pi with safe tool-turn resumption.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi",
+    "auto-compact",
+    "compaction",
+    "context-window",
+    "context-management",
+    "ai-agent"
+  ],
+  "license": "MIT",
+  "author": "Ashish Dhiman",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aashishd/pi-auto-compact-plugin.git"
+  },
+  "homepage": "https://github.com/aashishd/pi-auto-compact-plugin#readme",
+  "bugs": {
+    "url": "https://github.com/aashishd/pi-auto-compact-plugin/issues"
+  },
+  "files": [
+    "extensions",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/auto-compact/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.80.7",
+    "@earendil-works/pi-tui": "0.80.7",
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  },
+  "scripts": {
+    "test": "tsx --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "pack:dry-run": "npm pack --dry-run",
+    "check": "npm run typecheck && npm test && npm run pack:dry-run",
+    "prepublishOnly": "npm run check"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
