@@ -1,6 +1,6 @@
 {
   "name": "@thunstack/auto-compact",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Early, configurable context auto-compaction for Pi with safe tool-turn resumption.",
   "type": "module",
   "keywords": [
