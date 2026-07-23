@@ -4,8 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+	DEFAULT_COMPACTION_SETTINGS,
+	prepareCompaction,
+} from "../node_modules/@earendil-works/pi-coding-agent/dist/core/compaction/compaction.js";
+import {
 	AUTO_COMPACT_SESSION_ENTRY,
 	DEFAULT_AUTO_COMPACT_CONFIG,
+	hasCompactableHistory,
 	normalizeAutoCompactConfig,
 	readAutoCompactConfig,
 	registerAutoCompactExtension,
@@ -16,6 +21,7 @@ function createPiHarness({
 	config = {},
 	persistConfig = () => undefined,
 	compactImplementation = () => undefined,
+	canCompactSession = () => true,
 } = {}) {
 	const commands = new Map();
 	const handlers = new Map();
@@ -44,6 +50,8 @@ function createPiHarness({
 	const ctx = {
 		hasUI: true,
 		mode: "tui",
+		cwd: "/tmp/auto-compact-test",
+		isProjectTrusted: () => true,
 		ui: {
 			notify(message, level) {
 				notifications.push({ message, level });
@@ -67,6 +75,7 @@ function createPiHarness({
 		configPath: "/tmp/auto-compact-test.json",
 		initialConfig,
 		persistConfig,
+		canCompactSession,
 	});
 	const emit = async (name, event, context = ctx) => {
 		for (const handler of handlers.get(name) ?? []) {
@@ -300,6 +309,194 @@ test("new and forked sessions use the machine startup default instead of copied 
 	assert.equal(harness.entries.at(-1).data.isActive, true);
 });
 
+function sessionMessage(id, parentId, role, text, usage) {
+	return {
+		type: "message",
+		id,
+		parentId,
+		timestamp: new Date().toISOString(),
+		message: {
+			role,
+			content: [{ type: "text", text }],
+			...(role === "assistant"
+				? {
+						api: "openai-codex-responses",
+						provider: "openai-codex",
+						model: "gpt-5.6-sol",
+						usage:
+							usage ?? {
+								input: 1,
+								output: 1,
+								cacheRead: 0,
+								cacheWrite: 0,
+								totalTokens: 2,
+								cost: {
+									input: 0,
+									output: 0,
+									cacheRead: 0,
+									cacheWrite: 0,
+									total: 0,
+								},
+							},
+						stopReason: "stop",
+					}
+				: {}),
+			timestamp: Date.now(),
+		},
+	};
+}
+
+function highUsage() {
+	return {
+		input: 178_000,
+		output: 432,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 178_432,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
+}
+
+function assistantToolMessage(id, parentId, toolCallId) {
+	const entry = sessionMessage(id, parentId, "assistant", "");
+	entry.message.content = [
+		{ type: "toolCall", id: toolCallId, name: "read", arguments: {} },
+	];
+	entry.message.stopReason = "toolUse";
+	return entry;
+}
+
+function toolResultMessage(id, parentId, toolCallId, text) {
+	return {
+		type: "message",
+		id,
+		parentId,
+		timestamp: new Date().toISOString(),
+		message: {
+			role: "toolResult",
+			toolCallId,
+			toolName: "read",
+			content: [{ type: "text", text }],
+			isError: false,
+			timestamp: Date.now(),
+		},
+	};
+}
+
+test("compactability preflight exactly matches Pi preparation for small and eligible histories", () => {
+	const tooSmall = [
+		sessionMessage("u1", null, "user", "small request"),
+		sessionMessage("a1", "u1", "assistant", "small response", highUsage()),
+	];
+	const eligible = [
+		sessionMessage("u1", null, "user", "older request"),
+		sessionMessage("a1", "u1", "assistant", "older response"),
+		sessionMessage("u2", "a1", "user", "x".repeat(80)),
+		sessionMessage("a2", "u2", "assistant", "recent response"),
+	];
+
+	for (const { entries, keepRecentTokens } of [
+		{ entries: tooSmall, keepRecentTokens: DEFAULT_COMPACTION_SETTINGS.keepRecentTokens },
+		{ entries: eligible, keepRecentTokens: 10 },
+	]) {
+		assert.equal(
+			hasCompactableHistory(entries, keepRecentTokens),
+			prepareCompaction(entries, {
+				...DEFAULT_COMPACTION_SETTINGS,
+				keepRecentTokens,
+			}) !== undefined,
+		);
+	}
+	assert.equal(Number(((highUsage().totalTokens / 272_000) * 100).toFixed(1)), 65.6);
+	assert.equal(hasCompactableHistory(tooSmall, 20_000), false);
+	assert.equal(hasCompactableHistory(eligible, 10), true);
+
+	const completedCompaction = {
+		type: "compaction",
+		id: "c1",
+		parentId: "a2",
+		timestamp: new Date().toISOString(),
+		summary: "summary",
+		firstKeptEntryId: "u2",
+		tokensBefore: 100,
+	};
+	const endingInCompaction = [...eligible, completedCompaction];
+	assert.equal(hasCompactableHistory(endingInCompaction, 10), false);
+	assert.equal(
+		prepareCompaction(endingInCompaction, {
+			...DEFAULT_COMPACTION_SETTINGS,
+			keepRecentTokens: 10,
+		}),
+		undefined,
+	);
+
+	const splitTurn = [
+		sessionMessage("split-u1", null, "user", "one tool turn"),
+		assistantToolMessage("split-a1", "split-u1", "call-1"),
+		toolResultMessage("split-t1", "split-a1", "call-1", "x".repeat(100)),
+		sessionMessage("split-a2", "split-t1", "assistant", "recent response"),
+	];
+	const splitPreparation = prepareCompaction(splitTurn, {
+		...DEFAULT_COMPACTION_SETTINGS,
+		keepRecentTokens: 10,
+	});
+	assert.equal(splitPreparation?.isSplitTurn, true);
+	assert.equal(hasCompactableHistory(splitTurn, 10), true);
+
+	const afterPreviousCompaction = [
+		...eligible,
+		completedCompaction,
+		sessionMessage("u3", "c1", "user", "post-compaction request"),
+		sessionMessage("a3", "u3", "assistant", "post-compaction response"),
+		sessionMessage("u4", "a3", "user", "y".repeat(100)),
+		sessionMessage("a4", "u4", "assistant", "newest response"),
+	];
+	assert.equal(hasCompactableHistory(afterPreviousCompaction, 10), true);
+	assert.equal(
+		hasCompactableHistory(afterPreviousCompaction, 10),
+		prepareCompaction(afterPreviousCompaction, {
+			...DEFAULT_COMPACTION_SETTINGS,
+			keepRecentTokens: 10,
+		}) !== undefined,
+	);
+});
+
+test("high usage without compactable history is a non-destructive no-op", async () => {
+	let compactable = false;
+	const harness = createPiHarness({
+		canCompactSession: () => compactable,
+	});
+	await start(harness);
+	harness.setPercent(65.6);
+	await harness.emit("turn_end", toolTurn());
+	assert.equal(harness.compactCalls.length, 0);
+	assert.equal(harness.sentUserMessages.length, 0);
+	assert.equal(harness.notifications.length, 0);
+	assert.deepEqual(harness.runtime.getDetectorState(), {
+		armed: true,
+		inFlight: false,
+		generation: 1,
+	});
+
+	compactable = true;
+	await harness.emit("turn_end", toolTurn("tool-2"));
+	assert.equal(harness.compactCalls.length, 1);
+});
+
+test("eligibility check failure disarms detection without invoking compaction", async () => {
+	const harness = createPiHarness({
+		canCompactSession: () => {
+			throw new Error("settings unavailable");
+		},
+	});
+	await start(harness);
+	harness.setPercent(61);
+	await harness.emit("turn_end", toolTurn());
+	assert.equal(harness.compactCalls.length, 0);
+	assert.equal(harness.runtime.getDetectorState().armed, false);
+	assert.match(harness.notifications.at(-1).message, /eligibility check failed/);
+});
+
 test("inactive runtime never compacts above the configured threshold", async () => {
 	const harness = createPiHarness();
 	await start(harness);
@@ -408,7 +605,7 @@ test("successful auto-compaction resumes an interrupted tool turn exactly once",
 	]);
 });
 
-test("synchronous compact failure rearms, clears in-flight state, and does not resume", async () => {
+test("synchronous compact rejection disarms, clears state, and does not resume", async () => {
 	const harness = createPiHarness({
 		compactImplementation: () => {
 			throw new Error("synchronous failure");
@@ -419,7 +616,7 @@ test("synchronous compact failure rearms, clears in-flight state, and does not r
 	await harness.emit("turn_end", toolTurn());
 	assert.equal(harness.compactCalls.length, 1);
 	assert.deepEqual(harness.runtime.getDetectorState(), {
-		armed: true,
+		armed: false,
 		inFlight: false,
 		generation: 1,
 	});
@@ -459,13 +656,22 @@ test("session reload invalidates stale completion and error callbacks", async (t
 	});
 });
 
-test("does not resume final, terminal-tool, failed, stale, or disabled compactions", async (t) => {
+test("resumes only eligible interrupted compaction attempts", async (t) => {
 	await t.test("final assistant response", async () => {
 		const harness = createPiHarness();
 		await start(harness);
 		harness.setPercent(61);
 		await harness.emit("turn_end", finalTurn());
 		harness.compactCalls[0].onComplete({});
+		assert.equal(harness.sentUserMessages.length, 0);
+	});
+
+	await t.test("failed final assistant response", async () => {
+		const harness = createPiHarness();
+		await start(harness);
+		harness.setPercent(61);
+		await harness.emit("turn_end", finalTurn());
+		harness.compactCalls[0].onError(new Error("failed"));
 		assert.equal(harness.sentUserMessages.length, 0);
 	});
 
@@ -508,17 +714,29 @@ test("does not resume final, terminal-tool, failed, stale, or disabled compactio
 		assert.equal(harness.sentUserMessages.length, 0);
 	});
 
-	await t.test("compaction error rearms and retries on a later turn", async () => {
+	await t.test("compaction error resumes once and does not enter a retry loop", async () => {
 		const harness = createPiHarness();
 		await start(harness);
 		harness.setPercent(61);
 		await harness.emit("turn_end", toolTurn());
 		harness.compactCalls[0].onError(new Error("failed"));
-		assert.equal(harness.sentUserMessages.length, 0);
+		harness.compactCalls[0].onError(new Error("duplicate failure"));
+		assert.deepEqual(harness.sentUserMessages, [
+			{
+				content: DEFAULT_AUTO_COMPACT_CONFIG.resumptionInstruction,
+				options: { deliverAs: "followUp" },
+			},
+		]);
 		assert.equal(harness.runtime.getDetectorState().inFlight, false);
-		assert.equal(harness.runtime.getDetectorState().armed, true);
+		assert.equal(harness.runtime.getDetectorState().armed, false);
 
 		await harness.emit("turn_end", toolTurn("tool-2"));
+		assert.equal(harness.compactCalls.length, 1);
+
+		harness.setPercent(60);
+		await harness.emit("turn_end", finalTurn());
+		harness.setPercent(61);
+		await harness.emit("turn_end", toolTurn("tool-3"));
 		assert.equal(harness.compactCalls.length, 2);
 	});
 

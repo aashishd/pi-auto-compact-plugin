@@ -1,6 +1,6 @@
 # Pi Auto Compact
 
-Pi Auto Compact adds early, configurable context compaction to Pi and safely resumes unfinished tool-driven work after compaction.
+Pi Auto Compact adds early, configurable context compaction to Pi and safely resumes unfinished tool-driven work after a compaction attempt.
 
 It uses Pi's native compaction API and summary format. It does not replace Pi's summarizer, rewrite session history, or make a second model call outside Pi's compaction flow.
 
@@ -17,7 +17,7 @@ That native behavior does not provide an early percentage trigger, a session-onl
 | Summary generation | Pi's native compaction prompt and session format | Uses the same native flow with optional supplemental guidance |
 | Session-only control | No dedicated toggle | `/auto-compact` |
 | Interactive configuration | Settings file | `/auto-compact-config` TUI panel |
-| Resume interrupted tool work | Native retry handles overflow recovery | Queues one configurable follow-up after successful early compaction |
+| Resume interrupted tool work | Native retry handles overflow recovery | Queues one configurable follow-up after an interrupted early compaction attempt |
 
 ## Install
 
@@ -39,6 +39,8 @@ pi install git:github.com/aashishd/pi-auto-compact-plugin
 
 Pi packages execute with your full system permissions. Review third-party extension source before installing it.
 
+Version 0.2 requires Pi and Pi TUI 0.81.1. The exact version requirement keeps the extension's non-destructive eligibility check synchronized with Pi's native compaction rules.
+
 ## Commands
 
 | Command | Purpose |
@@ -57,9 +59,9 @@ Global settings are stored in `$PI_CODING_AGENT_DIR/auto-compact.json`, or `~/.p
 | `enabledAtSessionStart` | `true` | Global startup default | `true` or `false` | Sets whether new and forked sessions start with the extension active |
 | Active in current session | Startup default | Current session | `true` or `false` | Controlled by `/auto-compact`; restored on reload or resume and never written to global config |
 | `thresholdPercent` | `60` | Global | Integer `1` through `99` | Compacts only when context usage is strictly greater than this percentage |
-| `autoResume` | `true` | Global | `true` or `false` | Resumes only when compaction interrupted a non-terminating tool-driven turn |
-| `resumptionInstruction` | `Continue the unfinished work from the compaction summary. Preserve prior decisions, avoid repeating completed work, and proceed with the next pending step.` | Global | Any string | Follow-up user message queued once after successful interrupted compaction; blank disables the follow-up |
-| `waitForTurnEnd` | `true` | Fixed safety setting | `true` only | Defers compaction to Pi's `turn_end` boundary; `false` is rejected because Pi does not expose a safe reliable live boundary |
+| `autoResume` | `true` | Global | `true` or `false` | Resumes when an attempted compaction interrupted a non-terminating tool-driven turn, including after a compaction failure |
+| `resumptionInstruction` | `Continue the unfinished work from the compaction summary. Preserve prior decisions, avoid repeating completed work, and proceed with the next pending step.` | Global | Any string | Follow-up user message queued once after an interrupted compaction attempt finishes; blank disables the follow-up |
+| `waitForTurnEnd` | `true` | Fixed safety setting | `true` only | Defers compaction to Pi's `turn_end` boundary, where the extension first verifies that Pi has compactable native history |
 | `additionalCompactionInstruction` | `Preserve unfinished work and exact details required to resume safely.` | Global | Any string | Appends guidance to Pi's native compaction prompt; blank uses only the native prompt |
 
 Equivalent config file:
@@ -81,18 +83,19 @@ Use `/auto-compact-config` instead of editing the file when TUI mode is availabl
 ## How it behaves
 
 1. After each completed Pi turn, the extension reads the active model's context usage.
-2. When usage crosses above the configured threshold, it requests Pi's native compaction flow.
-3. The detector disarms until usage returns to or below the threshold, preventing repeated compactions at the same usage level.
-4. If that compaction interrupted a non-terminating tool-driven turn, the extension queues the resumption instruction exactly once.
-5. Session replacement or reload invalidates stale completion callbacks, so old compactions cannot resume a new runtime.
+2. Above the configured threshold, it applies Pi 0.81.1's native cut-point rules to the active branch using Pi's effective `keepRecentTokens` setting.
+3. If no history is eligible, it does not call `ctx.compact()`. The active run is left untouched, and eligibility is checked again after later turns add history.
+4. When eligible history exists, it requests Pi's native compaction flow and disarms until usage returns to or below the threshold.
+5. If that attempt interrupted a non-terminating tool-driven turn, the extension queues the resumption instruction exactly once after success or asynchronous failure.
+6. A failed attempt stays disarmed at the current usage level, preventing an abort-and-retry loop. Session replacement or reload also invalidates stale callbacks.
 
-A tool result that explicitly requests termination is respected, including mixed tool batches. Final assistant responses are never auto-resumed.
+A tool result that explicitly requests termination is respected, including mixed tool batches. Final assistant responses are never auto-resumed. A synchronous API rejection is treated as not having started compaction, so it does not enqueue a potentially duplicate continuation.
 
 ### Interaction with native auto-compaction
 
 This extension does not disable Pi's built-in threshold or overflow recovery. With the default 60% trigger, it normally compacts before Pi reaches its native reserve boundary. If native compaction runs first, Pi handles that event normally and this extension does not add its auto-resume message.
 
-Pi's native compaction settings still control how much recent context is kept and how much response space is reserved.
+Pi's native compaction settings still control how much recent context is kept and how much response space is reserved. The extension reads the effective native recent-context setting before every above-threshold eligibility decision, including trusted project overrides.
 
 ## Uninstall
 

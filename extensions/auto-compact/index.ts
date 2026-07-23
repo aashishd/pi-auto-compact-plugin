@@ -11,14 +11,18 @@ import {
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import type {
-	ExtensionAPI,
-	ExtensionCommandContext,
-	ExtensionContext,
-	ExtensionEvent,
-	SessionStartEvent,
-	Theme,
-	TurnEndEvent,
+import {
+	findCutPoint,
+	sessionEntryToContextMessages,
+	SettingsManager,
+	type ExtensionAPI,
+	type ExtensionCommandContext,
+	type ExtensionContext,
+	type ExtensionEvent,
+	type SessionEntry,
+	type SessionStartEvent,
+	type Theme,
+	type TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
 import {
 	Container,
@@ -183,6 +187,90 @@ function validPercent(value: unknown): value is number {
 	return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
 
+function hasContextMessages(
+	entries: SessionEntry[],
+	startIndex: number,
+	endIndex: number,
+): boolean {
+	for (let index = startIndex; index < endIndex; index++) {
+		const entry = entries[index];
+		if (
+			entry.type !== "compaction" &&
+			sessionEntryToContextMessages(entry).length > 0
+		) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * Mirror Pi 0.81.1's non-mutating prepareCompaction eligibility decision using
+ * its public cut-point and session-message APIs. This must stay synchronized
+ * with the pinned Pi peer version.
+ */
+export function hasCompactableHistory(
+	pathEntries: SessionEntry[],
+	keepRecentTokens: number,
+): boolean {
+	if (pathEntries.at(-1)?.type === "compaction") return false;
+
+	let previousCompactionIndex = -1;
+	for (let index = pathEntries.length - 1; index >= 0; index--) {
+		if (pathEntries[index].type === "compaction") {
+			previousCompactionIndex = index;
+			break;
+		}
+	}
+
+	let boundaryStart = 0;
+	if (previousCompactionIndex >= 0) {
+		const previousCompaction = pathEntries[previousCompactionIndex];
+		if (previousCompaction.type !== "compaction") return false;
+		const firstKeptEntryIndex = pathEntries.findIndex(
+			(entry) => entry.id === previousCompaction.firstKeptEntryId,
+		);
+		boundaryStart =
+			firstKeptEntryIndex >= 0
+				? firstKeptEntryIndex
+				: previousCompactionIndex + 1;
+	}
+
+	const cutPoint = findCutPoint(
+		pathEntries,
+		boundaryStart,
+		pathEntries.length,
+		keepRecentTokens,
+	);
+	if (!pathEntries[cutPoint.firstKeptEntryIndex]?.id) return false;
+
+	const historyEnd = cutPoint.isSplitTurn
+		? cutPoint.turnStartIndex
+		: cutPoint.firstKeptEntryIndex;
+	if (hasContextMessages(pathEntries, boundaryStart, historyEnd)) return true;
+
+	return (
+		cutPoint.isSplitTurn &&
+		hasContextMessages(
+			pathEntries,
+			cutPoint.turnStartIndex,
+			cutPoint.firstKeptEntryIndex,
+		)
+	);
+}
+
+export type CanCompactSession = (ctx: ExtensionContext) => boolean;
+
+export function canCompactCurrentSession(ctx: ExtensionContext): boolean {
+	const settings = SettingsManager.create(ctx.cwd, undefined, {
+		projectTrusted: ctx.isProjectTrusted(),
+	}).getCompactionSettings();
+	return hasCompactableHistory(
+		ctx.sessionManager.getBranch(),
+		settings.keepRecentTokens,
+	);
+}
+
 function restoreSessionActivation(ctx: ExtensionContext): boolean | undefined {
 	let restored: boolean | undefined;
 	for (const entry of ctx.sessionManager.getEntries()) {
@@ -230,6 +318,7 @@ export class AutoCompactRuntime {
 		private readonly configPath: string,
 		initialConfig: AutoCompactConfig,
 		private readonly persistConfig: PersistAutoCompactConfig = writeAutoCompactConfig,
+		private readonly canCompactSession: CanCompactSession = canCompactCurrentSession,
 	) {
 		this.config = normalizeAutoCompactConfig(initialConfig);
 		this.isActive = this.config.enabledAtSessionStart;
@@ -338,6 +427,18 @@ export class AutoCompactRuntime {
 			return;
 		}
 
+		try {
+			if (!this.canCompactSession(ctx)) return;
+		} catch (error) {
+			this.detectorArmed = false;
+			notify(
+				ctx,
+				`Auto-compaction eligibility check failed: ${errorMessage(error)}`,
+				"error",
+			);
+			return;
+		}
+
 		this.detectorArmed = false;
 		const token = Symbol("auto-compact");
 		const callbackGeneration = this.generation;
@@ -352,21 +453,7 @@ export class AutoCompactRuntime {
 			"info",
 		);
 
-		const settle = (error?: Error) => {
-			if (
-				callbackGeneration !== this.generation ||
-				this.inFlightToken !== token
-			) {
-				return;
-			}
-			this.inFlightToken = undefined;
-			if (error) {
-				this.detectorArmed = true;
-				notify(ctx, `Auto-compaction failed: ${error.message}`, "error");
-				return;
-			}
-
-			notify(ctx, "Auto-compaction completed.", "info");
+		const resumeInterruptedWork = () => {
 			if (!interrupted || !this.isActive || !this.config.autoResume) return;
 			const instruction = this.config.resumptionInstruction;
 			if (!instruction.trim()) return;
@@ -381,6 +468,24 @@ export class AutoCompactRuntime {
 			}
 		};
 
+		const settle = (error?: Error, resumeAfterFailure = true) => {
+			if (
+				callbackGeneration !== this.generation ||
+				this.inFlightToken !== token
+			) {
+				return;
+			}
+			this.inFlightToken = undefined;
+			if (error) {
+				notify(ctx, `Auto-compaction failed: ${error.message}`, "error");
+				if (resumeAfterFailure) resumeInterruptedWork();
+				return;
+			}
+
+			notify(ctx, "Auto-compaction completed.", "info");
+			resumeInterruptedWork();
+		};
+
 		try {
 			ctx.compact({
 				customInstructions,
@@ -388,7 +493,10 @@ export class AutoCompactRuntime {
 				onError: (error) => settle(error),
 			});
 		} catch (error) {
-			settle(error instanceof Error ? error : new Error(String(error)));
+			settle(
+				error instanceof Error ? error : new Error(String(error)),
+				false,
+			);
 		}
 	}
 }
@@ -528,13 +636,15 @@ function settingsItems(
 			label: "Auto-resume",
 			currentValue: yesNo(config.autoResume),
 			values: ["yes", "no"],
-			description: "Resume only when auto-compaction interrupted a tool-driven turn.",
+			description:
+				"Resume when an auto-compaction attempt interrupted a tool-driven turn, including after compaction failure.",
 		},
 		{
 			id: "resumptionInstruction",
 			label: "Resumption instruction",
 			currentValue: config.resumptionInstruction || "(empty)",
-			description: "User message queued once after successful interrupted compaction.",
+			description:
+				"User message queued once after an interrupted compaction attempt finishes.",
 			submenu: (_currentValue, done) =>
 				valueInput(
 					"Resumption instruction",
@@ -549,7 +659,7 @@ function settingsItems(
 			currentValue: "yes",
 			values: ["yes", "no"],
 			description:
-				"Safe-only in this version. No is deferred because Pi lacks a safe reliable live boundary.",
+				"Required together with the native-history eligibility preflight. Live compaction is not supported.",
 		},
 		{
 			id: "additionalCompactionInstruction",
@@ -725,6 +835,7 @@ export interface AutoCompactExtensionOptions {
 	configPath?: string;
 	initialConfig?: AutoCompactConfig;
 	persistConfig?: PersistAutoCompactConfig;
+	canCompactSession?: CanCompactSession;
 	onRuntime?: (runtime: AutoCompactRuntime) => void;
 }
 
@@ -738,6 +849,7 @@ export function registerAutoCompactExtension(
 		configPath,
 		options.initialConfig ?? readAutoCompactConfig(configPath),
 		options.persistConfig,
+		options.canCompactSession,
 	);
 	options.onRuntime?.(runtime);
 

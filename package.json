@@ -1,6 +1,6 @@
 {
   "name": "@thunstack/auto-compact",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Early, configurable context auto-compaction for Pi with safe tool-turn resumption.",
   "type": "module",
   "keywords": [
@@ -34,12 +34,12 @@
     ]
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*"
+    "@earendil-works/pi-coding-agent": "0.81.1",
+    "@earendil-works/pi-tui": "0.81.1"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "0.80.7",
-    "@earendil-works/pi-tui": "0.80.7",
+    "@earendil-works/pi-coding-agent": "0.81.1",
+    "@earendil-works/pi-tui": "0.81.1",
     "@types/node": "^24.0.0",
     "tsx": "^4.20.0",
     "typescript": "^5.9.0"
